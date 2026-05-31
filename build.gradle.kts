@@ -3,8 +3,8 @@ plugins {
 }
 
 allprojects {
-    group = "com.hdmain"
-    version = "0.1.0"
+    group = findProperty("group") as String
+    version = findProperty("version") as String
 
     repositories {
         mavenCentral()

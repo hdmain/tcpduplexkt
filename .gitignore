@@ -1,6 +1,7 @@
 .gradle/
 build/
 out/
+lib/bin/
 *.iml
 .idea/
 *.class

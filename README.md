@@ -1,51 +1,54 @@
 # tcpduplexkt
 
-**tcpduplexkt** is a Kotlin/JVM implementation of [tcpduplex](https://github.com/hdmain/tcpduplex): encrypted full-duplex messaging over TCP with X25519 ECDH, AES-256-GCM, length-prefixed records, and concurrent read/write loops. It is wire-compatible with the Go reference library and runs on the JVM and Android.
+Kotlin/JVM library for **encrypted full-duplex messaging over TCP** — wire-compatible with the Go reference [github.com/hdmain/tcpduplex](https://github.com/hdmain/tcpduplex).
 
-## Requirements
+## Features
 
-- JDK **11+**
-- Android **minSdk 21+** (via standard JVM dependency + BouncyCastle X25519)
+- X25519 ECDH key agreement + AES-256-GCM record encryption
+- Concurrent send/receive with bounded queues and graceful shutdown
+- Optional inbound callback mode (`onMessage`) or blocking `receive()`
+- Pre-shared key mixing and peer public-key fingerprint pinning
+- Runs on **JVM 11+** and **Android** (minSdk 21+)
 
-## Install
+## Installation
 
 ### Gradle (Kotlin DSL)
 
+**Maven Central** (when published):
+
 ```kotlin
 repositories {
-    mavenCentral() // after publishing
-    // or JitPack:
-    // maven { url = uri("https://jitpack.io") }
+    mavenCentral()
 }
 
 dependencies {
-    implementation("com.hdmain:tcpduplex:0.1.0")
+    implementation("com.hdmain:tcpduplex:0.2.0")
 }
 ```
 
-For a local checkout:
+**JitPack**:
 
 ```kotlin
-implementation(project(":lib"))
+repositories {
+    maven { url = uri("https://jitpack.io") }
+}
+
+dependencies {
+    implementation("com.github.hdmain:tcpduplexkt:0.2.0")
+}
+```
+
+**Local development**:
+
+```kotlin
+dependencies {
+    implementation(project(":lib"))
+}
 ```
 
 ### Android
 
-Add the same dependency in your app module's `build.gradle.kts`. No Android-specific artifact is required—the library uses `java.net.Socket` and standard JCE AES-GCM, with BouncyCastle for X25519 on all platforms.
-
-```kotlin
-dependencies {
-    implementation("com.hdmain:tcpduplex:0.1.0")
-}
-```
-
-## Features
-
-- **Duplex `Conn`**: `send` / `receive`, bounded queues, max message size
-- **Optional `onMessage`**: callback delivery path; `receive` is disabled when configured
-- **`Config`**: dial/handshake timeouts, protocol version, queue depths, PSK + peer fingerprint hooks
-- **`Server`**: `listen` + `serve` with per-connection handler
-- Subpackages `com.hdmain.tcpduplex.protocol` and `com.hdmain.tcpduplex.crypto`
+Add the dependency to your app module. BouncyCastle is bundled internally for X25519; AES-GCM uses the platform JCE.
 
 ## Quick start
 
@@ -54,37 +57,40 @@ dependencies {
 ```kotlin
 import com.hdmain.tcpduplex.TcpDuplex
 
-val conn = TcpDuplex.dial("127.0.0.1:9090")
-conn.use {
-    it.send("hello".toByteArray())
-    val msg = it.receive()
-    println(msg.decodeToString())
+fun main() {
+    TcpDuplex.connect("127.0.0.1", 9090).use { conn ->
+        conn.send("hello".toByteArray())
+        println(conn.receive().decodeToString())
+    }
 }
 ```
 
-### Server (manual accept)
+### Server (accept loop)
 
 ```kotlin
 import com.hdmain.tcpduplex.TcpDuplex
 import java.net.ServerSocket
 
-ServerSocket(9090).use { ss ->
-    val raw = ss.accept()
-    TcpDuplex.serveConn(raw).use { conn ->
-        val msg = conn.receive()
-        conn.send(msg)
+fun main() {
+    ServerSocket(9090).use { listener ->
+        while (true) {
+            TcpDuplex.accept(listener.accept()).use { conn ->
+                val msg = conn.receive()
+                conn.send(msg)
+            }
+        }
     }
 }
 ```
 
-### Server helper (`listen` + `serve`)
+### Server helper
 
 ```kotlin
 import com.hdmain.tcpduplex.TcpDuplex
 import java.util.concurrent.atomic.AtomicBoolean
 
 val stop = AtomicBoolean(false)
-val server = TcpDuplex.listen(9090)
+val server = TcpDuplex.listen(port = 9090)
 
 Thread {
     server.serve({ stop.get() }) { conn ->
@@ -98,54 +104,112 @@ Thread {
 
 ## Configuration
 
-Pass a non-nil `Config` to `TcpDuplex.dial` / `TcpDuplex.serveConn` / `TcpDuplex.listen`:
+Use [TcpDuplexConfig] for all connection and listener defaults:
 
-| Field | Role |
-|--------|------|
-| `dialTimeout` | TCP dial budget (default 30s) |
-| `handshakeTimeout` | Full ECDH exchange budget (default 15s) |
-| `protocolVersion` | Client-advertised wire revision (must be supported) |
-| `maxMessageBytes` | Max decrypted payload (default 512 KiB) |
-| `sendQueueDepth` / `receiveQueueDepth` | Backpressure for send/receive queues |
-| `onMessage` | Optional inbound handler; when set, `receive` throws `ReceiveDisabledException` |
-| `handshake.preSharedKey` | Mixed into key derivation (both peers must match) |
-| `handshake.expectedPeerPubKeySha256` | Optional SHA-256 pin of peer X25519 public key |
+```kotlin
+import com.hdmain.tcpduplex.HandshakeAuth
+import com.hdmain.tcpduplex.TcpDuplexConfig
+import java.time.Duration
 
-Use `peerPublicKeyFingerprint(pubKey)` to compute the fingerprint from raw pubkey bytes.
+val config = TcpDuplexConfig.builder()
+    .dialTimeout(Duration.ofSeconds(10))
+    .handshakeTimeout(Duration.ofSeconds(5))
+    .maxMessageBytes(64 * 1024)
+    .preSharedKey("rotate-this-secret".toByteArray())
+    .build()
+
+val conn = TcpDuplex.connect("10.0.0.5", 9090, config)
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `dialTimeout` | 30s | TCP connect budget |
+| `handshakeTimeout` | 15s | ECDH handshake budget |
+| `protocolVersion` | `1` | Wire revision (must match peer) |
+| `maxMessageBytes` | 512 KiB | Max plaintext per message |
+| `sendQueueDepth` | 256 | Outbound backpressure queue |
+| `receiveQueueDepth` | 256 | Inbound queue when using `receive()` |
+| `onMessage` | — | Async handler; disables `receive()` |
+| `handshake.preSharedKey` | — | Mixed into session key derivation |
+| `handshake.expectedPeerPublicKeySha256` | — | SHA-256 pin of peer X25519 key |
+
+Compute a fingerprint with `peerPublicKeyFingerprint(publicKey)` or `peerPublicKeyFingerprintHex(publicKey)`.
+
+## Error handling
+
+All library failures throw [TcpDuplexException] subtypes:
+
+```kotlin
+import com.hdmain.tcpduplex.TcpDuplexException
+
+try {
+    conn.receive()
+} catch (e: TcpDuplexException.ConnectionClosed) {
+    // peer closed or local shutdown
+} catch (e: TcpDuplexException.TimedOut) {
+    // deadline exceeded
+} catch (e: TcpDuplexException) {
+    // other typed errors
+}
+
+// Or classify programmatically:
+if (TcpDuplexException.isCausedBy(error, TcpDuplexException.PeerFingerprintMismatch::class.java)) {
+    // ...
+}
+```
+
+## Public API
+
+| Type | Role |
+|------|------|
+| [TcpDuplex] | Factory: `connect`, `accept`, `listen` |
+| [TcpDuplexConnection] | Encrypted session: `send`, `receive`, `close`, `shutdown` |
+| [TcpDuplexServer] | Listener: `serve`, `close` |
+| [TcpDuplexConfig] | Immutable configuration + `Builder` |
+| [HandshakeAuth] | PSK and fingerprint settings |
+| [TcpDuplexException] | Sealed error hierarchy |
+
+Implementation details (`internal.*`) are not part of the stable API and may change in minor releases.
 
 ## Wire format
 
-Identical to the Go library:
+1. **Handshake (plaintext):** magic `TDX1`, big-endian `uint16` version, 32-byte X25519 public key (client sends first).
+2. **Records:** big-endian `uint32` length, 1-byte type, AES-GCM blob (`nonce ‖ ciphertext ‖ tag`).
 
-1. **Handshake (plaintext)**: magic `TDX1`, `uint16` BE protocol version, 32-byte X25519 public key. Client sends first.
-2. **Records**: `uint32` BE length, type byte (`MsgText`, `MsgPing`, `MsgPong`, `MsgClose`), then AES-GCM sealed blob (`nonce ‖ ciphertext ‖ tag`).
+See the Go [protocol package](https://github.com/hdmain/tcpduplex/blob/main/protocol/protocol.go) for normative details.
 
-See the Go reference [`protocol` package](https://github.com/hdmain/tcpduplex/blob/main/protocol/protocol.go) for constants and details.
+## Publishing (maintainers)
 
-## Interoperability
+```bash
+./gradlew :lib:publishToMavenLocal
+```
 
-The Kotlin library interoperates with Go peers on the same wire protocol. Use the [Go reference implementation](https://github.com/hdmain/tcpduplex) as the other end.
+Signed release to Maven Central (requires `SIGNING_KEY` and `SIGNING_PASSWORD` in `~/.gradle/gradle.properties`):
 
-## Examples
+```bash
+./gradlew :lib:publish
+```
 
-| Path | Description |
-|------|-------------|
-| [`examples/simple`](examples/simple/) | Minimal listen/dial round-trip |
-
-## Testing
+## Development
 
 ```bash
 ./gradlew test
+./gradlew :lib:build
 ```
 
-## Security notes
+## Versioning
 
-Same as the Go library: symmetric keys derive from ECDH (optionally mixed with PSK). Fingerprint pinning checks the peer's **ephemeral** X25519 key from the handshake. This is **not** TLS—use TLS/QUIC on hostile networks.
+This project follows [Semantic Versioning](https://semver.org/). See [CHANGELOG.md](CHANGELOG.md).
+
+## Security
+
+Symmetric keys derive from ephemeral ECDH (optionally mixed with a PSK). Fingerprint pinning validates the peer's **ephemeral** X25519 key from the handshake — not a long-term certificate. This is **not TLS**; prefer TLS/QUIC on untrusted networks.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
 
-## Related
-
-- Go reference: [github.com/hdmain/tcpduplex](https://github.com/hdmain/tcpduplex)
+[TcpDuplex]: lib/src/main/kotlin/com/hdmain/tcpduplex/TcpDuplex.kt
+[TcpDuplexConnection]: lib/src/main/kotlin/com/hdmain/tcpduplex/TcpDuplexConnection.kt
+[TcpDuplexConfig]: lib/src/main/kotlin/com/hdmain/tcpduplex/TcpDuplexConfig.kt
+[TcpDuplexException]: lib/src/main/kotlin/com/hdmain/tcpduplex/TcpDuplexException.kt

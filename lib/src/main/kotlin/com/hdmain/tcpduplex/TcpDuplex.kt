@@ -1,138 +1,141 @@
 package com.hdmain.tcpduplex
 
-import com.hdmain.tcpduplex.crypto.clientHandshake
-import com.hdmain.tcpduplex.crypto.serverHandshake
-import com.hdmain.tcpduplex.protocol.Protocol
+import com.hdmain.tcpduplex.internal.ConnectionImpl
+import com.hdmain.tcpduplex.internal.ServerImpl
+import com.hdmain.tcpduplex.internal.Transport
+import com.hdmain.tcpduplex.internal.protocol.ProtocolConstants
+import com.hdmain.tcpduplex.internal.protocol.WireCodec
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.util.concurrent.atomic.AtomicBoolean
+import java.time.Duration
 
+/**
+ * Entry point for establishing encrypted full-duplex tcpduplex sessions.
+ *
+ * Wire-compatible with the Go reference: https://github.com/hdmain/tcpduplex
+ */
 object TcpDuplex {
-    /** Equivalent to [dial] with default config and no deadline. */
-    fun dial(address: String): Conn = dial(address, null, null)
 
-    /** Dials TCP, negotiates tcpduplex with protocolVersion from [cfg], and returns a running [Conn]. */
-    fun dial(address: String, cfg: Config?, connectTimeoutMillis: Long? = null): Conn {
-        val fc = freezeConfig(cfg)
-        if (!Protocol.supportsVersion(fc.protocolVersion)) {
-            throw Protocol.UnsupportedVersionException(fc.protocolVersion)
+    /** Supported wire protocol revision negotiated during handshake. */
+    const val CURRENT_PROTOCOL_VERSION: UShort = ProtocolConstants.CURRENT_VERSION
+
+    /** Connects to [host]:[port] with [config]. */
+    fun connect(
+        host: String,
+        port: Int,
+        config: TcpDuplexConfig = TcpDuplexConfig.DEFAULT,
+    ): TcpDuplexConnection = connect("$host:$port", config)
+
+    /** Connects to [address] in `host:port` form with [config]. */
+    fun connect(
+        address: String,
+        config: TcpDuplexConfig = TcpDuplexConfig.DEFAULT,
+    ): TcpDuplexConnection {
+        val resolved = ConfigResolver.resolve(config)
+        if (!WireCodec.supportsVersion(resolved.protocolVersion)) {
+            throw TcpDuplexException.UnsupportedProtocolVersion(resolved.protocolVersion)
         }
 
         val socket = Socket()
         try {
-            if (connectTimeoutMillis != null) {
-                socket.connect(parseAddress(address), connectTimeoutMillis.toInt())
-            } else {
-                socket.connect(parseAddress(address), fc.dialTimeout.toMillis().toInt())
-            }
-            val session = clientHandshakeContext(socket, fc)
-            return Conn(socket, session, fc)
+            socket.connect(
+                AddressParser.parse(address),
+                resolved.dialTimeout.toMillis().toInt().coerceAtLeast(1),
+            )
+            val session = Transport.performClientHandshake(socket, resolved)
+            return ConnectionImpl(socket, session, resolved)
         } catch (e: Exception) {
-            socket.close()
-            throw wrap("dial", e) ?: e
+            runCatching { socket.close() }
+            throw TcpDuplexException.wrap("connect", e)
         }
     }
 
-    /** Equivalent to [serveConn] with default config. */
-    fun serveConn(socket: Socket): Conn = serveConn(socket, null)
-
-    /** Completes the listener handshake and returns a running [Conn]. */
-    fun serveConn(socket: Socket, cfg: Config?): Conn {
-        val fc = freezeConfig(cfg)
+    /** Completes the server-side handshake on an already-accepted [socket]. */
+    fun accept(
+        socket: Socket,
+        config: TcpDuplexConfig = TcpDuplexConfig.DEFAULT,
+    ): TcpDuplexConnection {
+        val resolved = ConfigResolver.resolve(config)
         return try {
-            val session = serverHandshakeContext(socket, fc)
-            Conn(socket, session, fc)
+            val session = Transport.performServerHandshake(socket, resolved)
+            ConnectionImpl(socket, session, resolved)
         } catch (e: Exception) {
-            socket.close()
-            throw wrap("handshake", e) ?: e
+            runCatching { socket.close() }
+            throw TcpDuplexException.wrap("accept", e)
         }
     }
 
-    /** Opens a TCP listener. [cfg] may be null (defaults applied per connection). */
-    fun listen(port: Int, cfg: Config? = null): Server = listen("0.0.0.0", port, cfg)
-
-    fun listen(host: String, port: Int, cfg: Config? = null): Server {
+    /** Binds a TCP listener on [host]:[port]. */
+    fun listen(
+        host: String = "0.0.0.0",
+        port: Int,
+        config: TcpDuplexConfig = TcpDuplexConfig.DEFAULT,
+    ): TcpDuplexServer {
         return try {
-            val ss = ServerSocket()
-            ss.bind(InetSocketAddress(host, port))
-            Server(cfg, ss)
+            val serverSocket = ServerSocket()
+            serverSocket.bind(InetSocketAddress(host, port))
+            ServerImpl(config, serverSocket)
         } catch (e: Exception) {
-            throw wrap("listen", e) ?: e
+            throw TcpDuplexException.wrap("listen", e)
         }
     }
 
-    private fun parseAddress(address: String): InetSocketAddress {
+    /** @see connect */
+    @Deprecated("Use connect()", ReplaceWith("connect(address, config)"))
+    fun dial(address: String, config: TcpDuplexConfig? = null): TcpDuplexConnection =
+        connect(address, config ?: TcpDuplexConfig.DEFAULT)
+
+    /** @see accept */
+    @Deprecated("Use accept()", ReplaceWith("accept(socket, config)"))
+    fun serveConn(socket: Socket, config: TcpDuplexConfig? = null): TcpDuplexConnection =
+        accept(socket, config ?: TcpDuplexConfig.DEFAULT)
+}
+
+internal object AddressParser {
+    fun parse(address: String): InetSocketAddress {
         val lastColon = address.lastIndexOf(':')
-        if (lastColon <= 0) {
-            throw IllegalArgumentException("invalid address: $address")
-        }
+        require(lastColon > 0) { "invalid address (expected host:port): $address" }
         val host = address.substring(0, lastColon)
-        val port = address.substring(lastColon + 1).toInt()
+        val port = address.substring(lastColon + 1).toIntOrNull()
+            ?: throw IllegalArgumentException("invalid port in address: $address")
         return InetSocketAddress(host, port)
-    }
-
-    private fun clientHandshakeContext(socket: Socket, fc: FrozenConfig): com.hdmain.tcpduplex.crypto.Session {
-        val input = socket.getInputStream()
-        val output = socket.getOutputStream()
-        if (fc.handshakeTimeout.toMillis() > 0) {
-            socket.soTimeout = fc.handshakeTimeout.toMillis().toInt()
-        }
-        return try {
-            clientHandshake(input, output, fc.protocolVersion, handshakeOpts(fc))
-        } finally {
-            socket.soTimeout = 0
-        }
-    }
-
-    private fun serverHandshakeContext(socket: Socket, fc: FrozenConfig): com.hdmain.tcpduplex.crypto.Session {
-        val input = socket.getInputStream()
-        val output = socket.getOutputStream()
-        if (fc.handshakeTimeout.toMillis() > 0) {
-            socket.soTimeout = fc.handshakeTimeout.toMillis().toInt()
-        }
-        return try {
-            serverHandshake(input, output, handshakeOpts(fc)).first
-        } finally {
-            socket.soTimeout = 0
-        }
     }
 }
 
-/** Wraps a [ServerSocket] configured with shared tcpduplex defaults for accepted peers. */
-class Server internal constructor(
-    private val cfg: Config?,
-    private val serverSocket: ServerSocket,
-) : AutoCloseable {
-    private val stopped = AtomicBoolean(false)
+internal object ConfigResolver {
+    data class ResolvedConfig(
+        val dialTimeout: Duration,
+        val handshakeTimeout: Duration,
+        val protocolVersion: UShort,
+        val maxMessageBytes: Int,
+        val sendQueueDepth: Int,
+        val receiveQueueDepth: Int,
+        val onMessage: ((ByteArray) -> Unit)?,
+        val onMessageBufferDepth: Int,
+        val disconnectOnSlowCallbackConsumer: Boolean,
+        val handshake: HandshakeAuth,
+    )
 
-    fun addr(): InetSocketAddress = serverSocket.localSocketAddress as InetSocketAddress
-
-    override fun close() {
-        stopped.set(true)
-        serverSocket.close()
-    }
-
-    /**
-     * Accepts connections until [stopWhen] returns true or accept fails.
-     * Each accepted socket is passed to [onConnect] after handshake.
-     */
-    fun serve(stopWhen: () -> Boolean, onConnect: (Conn) -> Unit) {
-        while (!stopWhen() && !stopped.get()) {
-            val raw = try {
-                serverSocket.accept()
-            } catch (_: Exception) {
-                if (stopWhen() || stopped.get()) return
-                continue
-            }
-            Thread({
-                try {
-                    val conn = TcpDuplex.serveConn(raw, cfg)
-                    onConnect(conn)
-                } catch (_: Exception) {
-                    raw.close()
-                }
-            }, "tcpduplex-accept").apply { isDaemon = true }.start()
-        }
+    fun resolve(config: TcpDuplexConfig): ResolvedConfig {
+        val defaults = TcpDuplexConfig.DEFAULT
+        return ResolvedConfig(
+            dialTimeout = config.dialTimeout.takeIf { !it.isZero && !it.isNegative } ?: defaults.dialTimeout,
+            handshakeTimeout = config.handshakeTimeout.takeIf { !it.isZero && !it.isNegative }
+                ?: defaults.handshakeTimeout,
+            protocolVersion = config.protocolVersion.takeIf { it != 0u.toUShort() }
+                ?: defaults.protocolVersion,
+            maxMessageBytes = config.maxMessageBytes.takeIf { it > 0 } ?: defaults.maxMessageBytes,
+            sendQueueDepth = config.sendQueueDepth.takeIf { it > 0 } ?: defaults.sendQueueDepth,
+            receiveQueueDepth = config.receiveQueueDepth.takeIf { it > 0 } ?: defaults.receiveQueueDepth,
+            onMessage = config.onMessage,
+            onMessageBufferDepth = if (config.onMessage != null && config.onMessageBufferDepth <= 0) {
+                defaults.onMessageBufferDepth
+            } else {
+                config.onMessageBufferDepth
+            },
+            disconnectOnSlowCallbackConsumer = config.disconnectOnSlowCallbackConsumer,
+            handshake = config.handshake,
+        )
     }
 }
