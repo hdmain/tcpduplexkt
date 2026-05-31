@@ -7,7 +7,3 @@ out/
 *.jar
 !gradle/wrapper/gradle-wrapper.jar
 .DS_Store
-tcpduplex/interop/interop
-tcpduplex/interop/interop.exe
-tcpduplex/bin/
-tcpduplex/server

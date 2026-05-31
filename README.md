@@ -120,24 +120,17 @@ Identical to the Go library:
 1. **Handshake (plaintext)**: magic `TDX1`, `uint16` BE protocol version, 32-byte X25519 public key. Client sends first.
 2. **Records**: `uint32` BE length, type byte (`MsgText`, `MsgPing`, `MsgPong`, `MsgClose`), then AES-GCM sealed blob (`nonce ‖ ciphertext ‖ tag`).
 
-See the Go [`protocol` package](tcpduplex/protocol/protocol.go) for constants and details.
+See the Go reference [`protocol` package](https://github.com/hdmain/tcpduplex/blob/main/protocol/protocol.go) for constants and details.
 
 ## Interoperability
 
-The Kotlin library interoperates with Go peers on the same wire protocol. Run cross-language tests:
-
-```bash
-./gradlew :lib:test --tests "com.hdmain.tcpduplex.InteropTest"
-```
-
-Or use the harness under `tcpduplex/interop/`.
+The Kotlin library interoperates with Go peers on the same wire protocol. Use the [Go reference implementation](https://github.com/hdmain/tcpduplex) as the other end.
 
 ## Examples
 
 | Path | Description |
 |------|-------------|
 | [`examples/simple`](examples/simple/) | Minimal listen/dial round-trip |
-| [`tcpduplex/examples/simple`](tcpduplex/examples/simple/) | Go equivalent |
 
 ## Testing
 
