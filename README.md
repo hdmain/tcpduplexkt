@@ -2,6 +2,17 @@
 
 Kotlin/JVM library for **encrypted full-duplex messaging over TCP** — wire-compatible with the Go reference [github.com/hdmain/tcpduplex](https://github.com/hdmain/tcpduplex).
 
+## Other languages
+
+Wire-compatible ports of the same protocol:
+
+| Language | Repository |
+|----------|------------|
+| Go | [tcpduplex](https://github.com/hdmain/tcpduplex) |
+| Kotlin / Android (this repo) | [tcpduplexkt](https://github.com/hdmain/tcpduplexkt) |
+| C++20 | [cpptcpduplex](https://github.com/hdmain/cpptcpduplex) |
+| Rust | [rutcpduplex](https://github.com/hdmain/rutcpduplex) |
+
 ## Features
 
 - X25519 ECDH key agreement + AES-256-GCM record encryption
